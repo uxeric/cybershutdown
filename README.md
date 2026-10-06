@@ -7,7 +7,7 @@
 # cshutdown
 
 **Your computer doesn't turn off. It flatlines.**<br>
-A Cyberpunk 2077 system crash in your terminal, nine seconds long, then `shutdown -h now`. Any key aborts.
+A cyberpunk style system crash in your terminal, nine seconds long, then `shutdown -h now`. Any key aborts.
 
 <a href="#jack-in"><img alt="Python standard library" src="https://img.shields.io/badge/python-stdlib_only-ff003c?style=for-the-badge&logo=python&logoColor=white&labelColor=05030a"></a>
 <img alt="0 dependencies" src="https://img.shields.io/badge/dependencies-0-00f0ff?style=for-the-badge&labelColor=05030a">
@@ -53,22 +53,6 @@ Both open a terminal that goes fullscreen before the crash starts. Try it first 
 ```sh
 cshutdown --dry-run
 ```
-
-<details>
-<summary><b>Installer options</b></summary>
-
-| Command or variable | Does |
-|---|---|
-| `./install.sh` | install from a checkout instead of downloading |
-| `./install.sh --uninstall` | remove the command, the menu item and the launcher entry |
-| `CSHUTDOWN_PREFIX` | install prefix (default `~/.local`) |
-| `CSHUTDOWN_REF` | branch or tag to install (default: the default branch) |
-| `CSHUTDOWN_REPO` | GitHub `owner/name` to download from (default `uxeric/cshutdown`) |
-| `CSHUTDOWN_NO_OMARCHY=1` | skip the menu item and launcher entry |
-
-The menu item lives in `~/.config/omarchy/extensions/omarchy-menu.jsonc`. The installer adds one line, checks that the file still parses the way the menu parses it, and leaves the file alone if it doesn't.
-
-</details>
 
 <img src="assets/readme/divider.svg" width="100%" alt="">
 
@@ -124,10 +108,6 @@ cshutdown --fullscreen    # make this terminal window fullscreen first (Hyprland
 > [!TIP]
 > **Can I make it longer?**<br>
 > No. It's capped under ten seconds. You have places to be, choom.
-
-> [!WARNING]
-> **Is this affiliated with CD PROJEKT RED?**<br>
-> No. It's a fan tribute. Arasaka is not responsible for your engrams.
 
 <div align="center">
 <br>
