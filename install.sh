@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # cshutdown installer: installs the `cshutdown` command for the current user.
 #
-#   curl -fsSL https://raw.githubusercontent.com/uxeric/cshutdown/HEAD/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/uxeric/cybershutdown/HEAD/install.sh | bash
 #   ./install.sh                 # from a checkout: installs that checkout
 #   ./install.sh --uninstall     # removes cshutdown, its menu item and launcher entry
 #
 # Settings (environment variables):
-#   CSHUTDOWN_REPO        GitHub owner/name to download from  (default: uxeric/cshutdown)
+#   CSHUTDOWN_REPO        GitHub owner/name to download from  (default: uxeric/cybershutdown)
 #   CSHUTDOWN_REF         branch or tag to install            (default: the repo's default branch)
 #   CSHUTDOWN_PREFIX      install prefix                      (default: ~/.local, so cshutdown goes in ~/.local/bin)
 #   CSHUTDOWN_SOURCE_DIR  install from this directory instead of downloading
@@ -14,7 +14,7 @@
 
 set -euo pipefail
 
-REPO="${CSHUTDOWN_REPO:-uxeric/cshutdown}"
+REPO="${CSHUTDOWN_REPO:-uxeric/cybershutdown}"
 REF="${CSHUTDOWN_REF:-HEAD}"
 PREFIX="${CSHUTDOWN_PREFIX:-$HOME/.local}"
 BIN_DIR="$PREFIX/bin"

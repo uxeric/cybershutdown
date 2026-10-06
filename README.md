@@ -36,7 +36,7 @@ A cyberpunk style system crash in your terminal, nine seconds long, then `shutdo
 ## Jack in
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/uxeric/cshutdown/HEAD/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/uxeric/cybershutdown/HEAD/install.sh | bash
 ```
 
 It installs `cshutdown` into `~/.local/bin`, no root needed. Run the same line again to update.
