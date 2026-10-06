@@ -2,7 +2,7 @@
 
 <img src="assets/readme/hero.svg" width="100%" alt="cshutdown crashes the screen: a WARNING over hazard stripes, then a HUD with a syslog killing processes, a breach-protocol grid, a glitching SYSTEM FAILURE title, a countdown and a fading heart monitor; the screen melts into FLATLINE and collapses like an old CRT to a dot and SIGNAL LOST.">
 
-<br>
+<br><br>
 <img src="assets/icon.png" width="72" alt="">
 
 # cshutdown
