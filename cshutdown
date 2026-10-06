@@ -1,0 +1,1305 @@
+#!/usr/bin/env python3
+"""cshutdown: a Cyberpunk 2077 style system-crash shutdown sequence.
+
+Plays an animated countdown of under 10 seconds, then runs `shutdown -h now`.
+Any key, Ctrl-C, or closing the terminal aborts. Only a sequence that runs to
+the end shuts the machine down.
+"""
+
+import argparse
+import getpass
+import json
+import math
+import os
+import random
+import select
+import signal
+import socket
+import subprocess
+import sys
+import termios
+import time
+
+VERSION = "1.0.0"
+FPS = 60
+FRAME = 1.0 / FPS
+SHUTDOWN_CMD = ["shutdown", "-h", "now"]
+
+# ── palette ──────────────────────────────────────────────────────────────────
+BLACK = 0x000000
+BG = 0x05030A
+WHITE = 0xF4F4F4
+YELLOW = 0xFCEE0A
+CYAN = 0x00F0FF
+RED = 0xFF003C
+PINK = 0xFF2A6D
+ORANGE = 0xFF7A00
+GREEN = 0x39FF88
+DIM_YELLOW = 0x6B6500
+DIM_CYAN = 0x0B5560
+DIM_RED = 0x5A0016
+BLOOD = 0x2A0008
+GREY = 0x6A6A78
+
+NOISE = "░▒▓█▚▞▙▟▛▜▀▄▌▐"
+GLYPHS = "!<>-_\\/[]{}=+*^?#ABCDEF0123456789$%&"
+HEX = "0123456789ABCDEF"
+BREACH_CODES = ["1C", "55", "BD", "E9", "7A", "FF"]
+
+
+def rgb(c):
+    return (c >> 16) & 255, (c >> 8) & 255, c & 255
+
+
+def mix(a, b, t):
+    if t <= 0:
+        return a
+    if t >= 1:
+        return b
+    ar, ag, ab = rgb(a)
+    br, bg, bb = rgb(b)
+    return (int(ar + (br - ar) * t) << 16) | (int(ag + (bg - ag) * t) << 8) | int(ab + (bb - ab) * t)
+
+
+def clamp(v, lo=0.0, hi=1.0):
+    return lo if v < lo else hi if v > hi else v
+
+
+def ease_out(t):
+    return 1 - (1 - clamp(t)) ** 3
+
+
+# ── block font ───────────────────────────────────────────────────────────────
+FONT = {
+    "A": [".###.", "#...#", "#####", "#...#", "#...#"],
+    "B": ["####.", "#...#", "####.", "#...#", "####."],
+    "C": [".####", "#....", "#....", "#....", ".####"],
+    "D": ["####.", "#...#", "#...#", "#...#", "####."],
+    "E": ["#####", "#....", "####.", "#....", "#####"],
+    "F": ["#####", "#....", "####.", "#....", "#...."],
+    "G": [".####", "#....", "#..##", "#...#", ".####"],
+    "H": ["#...#", "#...#", "#####", "#...#", "#...#"],
+    "I": ["###", ".#.", ".#.", ".#.", "###"],
+    "J": ["..###", "...#.", "...#.", "#..#.", ".##.."],
+    "K": ["#...#", "#..#.", "###..", "#..#.", "#...#"],
+    "L": ["#....", "#....", "#....", "#....", "#####"],
+    "M": ["#...#", "##.##", "#.#.#", "#...#", "#...#"],
+    "N": ["#...#", "##..#", "#.#.#", "#..##", "#...#"],
+    "O": [".###.", "#...#", "#...#", "#...#", ".###."],
+    "P": ["####.", "#...#", "####.", "#....", "#...."],
+    "Q": [".###.", "#...#", "#.#.#", "#..#.", ".##.#"],
+    "R": ["####.", "#...#", "####.", "#..#.", "#...#"],
+    "S": [".####", "#....", ".###.", "....#", "####."],
+    "T": ["#####", "..#..", "..#..", "..#..", "..#.."],
+    "U": ["#...#", "#...#", "#...#", "#...#", ".###."],
+    "V": ["#...#", "#...#", "#...#", ".#.#.", "..#.."],
+    "W": ["#...#", "#...#", "#.#.#", "##.##", "#...#"],
+    "X": ["#...#", ".#.#.", "..#..", ".#.#.", "#...#"],
+    "Y": ["#...#", ".#.#.", "..#..", "..#..", "..#.."],
+    "Z": ["#####", "...#.", "..#..", ".#...", "#####"],
+    "0": [".###.", "#..##", "#.#.#", "##..#", ".###."],
+    "1": ["..#..", ".##..", "..#..", "..#..", ".###."],
+    "2": [".###.", "#...#", "..##.", ".#...", "#####"],
+    "3": ["####.", "....#", ".###.", "....#", "####."],
+    "4": ["#...#", "#...#", "#####", "....#", "....#"],
+    "5": ["#####", "#....", "####.", "....#", "####."],
+    "6": [".###.", "#....", "####.", "#...#", ".###."],
+    "7": ["#####", "....#", "...#.", "..#..", "..#.."],
+    "8": [".###.", "#...#", ".###.", "#...#", ".###."],
+    "9": [".###.", "#...#", ".####", "....#", ".###."],
+    " ": ["...", "...", "...", "...", "..."],
+    "-": ["...", "...", "###", "...", "..."],
+    ".": [".", ".", ".", ".", "#"],
+    ":": [".", "#", ".", "#", "."],
+    "/": ["....#", "...#.", "..#..", ".#...", "#...."],
+    "!": ["#", "#", "#", ".", "#"],
+    "?": [".###.", "#...#", "..##.", ".....", "..#.."],
+}
+
+
+HALF = {(False, False): " ", (True, False): "▀", (False, True): "▄", (True, True): "█"}
+
+
+class Big:
+    """Block-font text as rows of cells, scaled and sheared into an italic.
+
+    ph=0.5 packs two pixel rows into each cell with half blocks, which keeps
+    pixels square at the smallest size. A newline stacks centred lines.
+    """
+
+    def __init__(self, text, pw=1, ph=1):
+        lines = []
+        for part in text.split("\n"):
+            px = [""] * 5
+            for k, c in enumerate(part):
+                g = FONT.get(c, FONT["?"])
+                for r in range(5):
+                    px[r] += g[r] + ("." if k < len(part) - 1 else "")
+            lines.append(px)
+        width = max(len(px[0]) for px in lines)
+        bitmap = []
+        for i, px in enumerate(lines):
+            if i:
+                bitmap.append("." * width)
+            pad = (width - len(px[0])) // 2
+            bitmap.extend(("." * pad + r).ljust(width, ".") for r in px)
+        bitmap = ["".join(c * pw for c in r) for r in bitmap]
+        if ph == 0.5:
+            if len(bitmap) % 2:
+                bitmap.append("." * len(bitmap[0]))
+            rows = ["".join(HALF[a == "#", b == "#"] for a, b in zip(top, bot)) for top, bot in zip(bitmap[0::2], bitmap[1::2])]
+        else:
+            rows = []
+            for r in bitmap:
+                rows.extend([r.replace("#", "█").replace(".", " ")] * ph)
+        self.rows = rows
+        self.h = len(rows)
+        self.shear = [int((self.h - 1 - r) * 0.5 * pw / ph) for r in range(self.h)]
+        self.w = len(rows[0]) + self.shear[0]
+
+
+def fit_big(texts, max_w, max_h, scales):
+    for text in texts:
+        for pw, ph in scales:
+            b = Big(text, pw, ph)
+            if b.w <= max_w and b.h <= max_h:
+                return b
+    return None
+
+
+# ── frame buffer ─────────────────────────────────────────────────────────────
+_FG, _BG = {}, {}
+
+
+def fg_esc(c):
+    s = _FG.get(c)
+    if s is None:
+        s = _FG[c] = "\x1b[38;2;%d;%d;%dm" % rgb(c)
+    return s
+
+
+def bg_esc(c):
+    s = _BG.get(c)
+    if s is None:
+        s = _BG[c] = "\x1b[48;2;%d;%d;%dm" % rgb(c)
+    return s
+
+
+class Screen:
+    def __init__(self, fd):
+        self.fd = fd
+        self.w = self.h = self.n = 0
+        self.ch = self.fg = self.bg = []
+        self.resize()
+
+    def resize(self):
+        try:
+            w, h = os.get_terminal_size(self.fd)
+        except OSError:
+            w, h = 80, 24
+        w, h = max(w, 20), max(h, 8)
+        if (w, h) == (self.w, self.h):
+            return False
+        self.w, self.h, self.n = w, h, w * h
+        self.pch = self.pfg = self.pbg = None
+        self.clear()
+        return True
+
+    def clear(self, bg=BG):
+        n = self.n
+        self.ch = [" "] * n
+        self.fg = [WHITE] * n
+        self.bg = [bg] * n
+
+    def snapshot(self):
+        return (self.w, self.h, self.ch[:], self.fg[:], self.bg[:])
+
+    def restore(self, snap):
+        w, h, ch, fg, bg = snap
+        if (w, h) != (self.w, self.h):
+            return False
+        self.ch, self.fg, self.bg = ch[:], fg[:], bg[:]
+        return True
+
+    def put(self, x, y, s, fg, bg=None):
+        if y < 0 or y >= self.h or not s:
+            return
+        if x < 0:
+            s = s[-x:]
+            x = 0
+        if x + len(s) > self.w:
+            s = s[: self.w - x]
+        n = len(s)
+        if n <= 0:
+            return
+        i = y * self.w + x
+        self.ch[i : i + n] = list(s)
+        self.fg[i : i + n] = [fg] * n
+        if bg is not None:
+            self.bg[i : i + n] = [bg] * n
+
+    def cell(self, x, y, c, fg, bg=None):
+        if 0 <= x < self.w and 0 <= y < self.h:
+            i = y * self.w + x
+            self.ch[i] = c
+            self.fg[i] = fg
+            if bg is not None:
+                self.bg[i] = bg
+
+    def fill(self, x, y, w, h, c, fg, bg=None):
+        for yy in range(y, y + h):
+            self.put(x, yy, c * w, fg, bg)
+
+    def flush(self):
+        w = self.w
+        ch, fg, bg = self.ch, self.fg, self.bg
+        pch, pfg, pbg = self.pch, self.pfg, self.pbg
+        full = pch is None
+        out = ["\x1b[?2026h"]
+        cf = cb = -1
+        for y in range(self.h):
+            a = y * w
+            b = a + w
+            if not full and ch[a:b] == pch[a:b] and fg[a:b] == pfg[a:b] and bg[a:b] == pbg[a:b]:
+                continue
+            nxt = -1
+            for i in range(a, b):
+                c, f, g = ch[i], fg[i], bg[i]
+                if not full and c == pch[i] and f == pfg[i] and g == pbg[i]:
+                    continue
+                if i != nxt:
+                    out.append("\x1b[%d;%dH" % (y + 1, i - a + 1))
+                if g != cb:
+                    out.append(bg_esc(g))
+                    cb = g
+                if f != cf and c != " ":
+                    out.append(fg_esc(f))
+                    cf = f
+                out.append(c)
+                nxt = i + 1
+        out.append("\x1b[?2026l")
+        data = "".join(out).encode()
+        while data:
+            k = os.write(self.fd, data)
+            data = data[k:]
+        # clear() hands out fresh lists every frame, so keeping references is safe
+        self.pch, self.pfg, self.pbg = ch, fg, bg
+
+
+# ── drawing helpers ──────────────────────────────────────────────────────────
+def draw_big(scr, x, y, big, color, ghost=False, jitter=None):
+    for r, line in enumerate(big.rows):
+        yy = y + r
+        if yy < 0 or yy >= scr.h:
+            continue
+        base = x + big.shear[r] + (jitter[r] if jitter else 0)
+        col = color(r, big.h) if callable(color) else color
+        for c, px in enumerate(line):
+            if px != " ":
+                scr.cell(base + c, yy, "▓" if ghost and px == "█" else px, col)
+
+
+def draw_big_rgb(scr, x, y, big, color, split, jitter=None):
+    """Chromatic aberration: red and cyan ghosts either side of the main glyphs."""
+    if split:
+        draw_big(scr, x - split, y, big, RED, True, jitter)
+        draw_big(scr, x + split, y, big, CYAN, True, jitter)
+    draw_big(scr, x, y, big, color, False, jitter)
+
+
+def decode(text, f, rnd):
+    """Text that resolves left to right out of random glyphs."""
+    k = int(len(text) * clamp(f))
+    tail = "".join(" " if c == " " else rnd.choice(GLYPHS) for c in text[k:])
+    return text[:k] + tail
+
+
+def box(scr, x, y, w, h, color, label=None, reveal=1.0, label_color=BLACK, label_bg=YELLOW):
+    """A HUD frame with notched corners. `reveal` draws the perimeter in."""
+    if w < 4 or h < 3:
+        return
+    r = clamp(reveal)
+    tw = int((w - 2) * r)
+    th = int((h - 2) * r)
+    scr.put(x + 1, y, "─" * tw, color)
+    scr.put(x + w - 1 - tw, y + h - 1, "─" * tw, color)
+    for k in range(th):
+        scr.cell(x, y + 1 + k, "│", color)
+        scr.cell(x + w - 1, y + h - 2 - k, "│", color)
+    if r >= 1:
+        scr.cell(x, y, "┌", color)
+        scr.cell(x + w - 1, y, "◣", color)
+        scr.cell(x, y + h - 1, "◥", color)
+        scr.cell(x + w - 1, y + h - 1, "┘", color)
+        if label and w > len(label) + 6:
+            scr.put(x + 2, y, " " + label + " ", label_color, label_bg)
+            scr.cell(x + 3 + len(label) + 1, y, "◤", label_bg)
+
+
+def hazard(scr, y, offset, color=YELLOW, bg=BG):
+    """One row of slanted hazard stripes."""
+    if y < 0 or y >= scr.h:
+        return
+    pat = ("◢", None, None, "◤", " ", " ")
+    for x in range(scr.w):
+        k = (x + offset) % 6
+        p = pat[k]
+        if p is None:
+            scr.cell(x, y, " ", color, color)
+        else:
+            scr.cell(x, y, p, color, bg)
+
+
+# ── glitch post-processing (mutates the frame buffer in place) ──────────────
+def tear(scr, y, hgt, dx):
+    w = scr.w
+    dx %= w
+    if not dx:
+        return
+    for yy in range(max(0, y), min(scr.h, y + hgt)):
+        a = yy * w
+        b = a + w
+        for arr in (scr.ch, scr.fg, scr.bg):
+            row = arr[a:b]
+            arr[a:b] = row[-dx:] + row[:-dx]
+
+
+def corrupt_block(scr, rnd, palette):
+    bw = rnd.randint(3, max(4, scr.w // 5))
+    bh = rnd.randint(1, 3)
+    x = rnd.randrange(scr.w)
+    y = rnd.randrange(scr.h)
+    col = rnd.choice(palette)
+    bgc = rnd.choice((BG, BG, BLOOD, DIM_CYAN, col))
+    for yy in range(y, min(scr.h, y + bh)):
+        for xx in range(x, min(scr.w, x + bw)):
+            scr.cell(xx, yy, rnd.choice(NOISE), col, bgc)
+
+
+def scatter(scr, rnd, count, palette):
+    n = scr.n
+    ch, fg = scr.ch, scr.fg
+    for _ in range(count):
+        i = rnd.randrange(n)
+        ch[i] = rnd.choice(NOISE)
+        fg[i] = rnd.choice(palette)
+
+
+def invert_band(scr, y, hgt):
+    w = scr.w
+    for yy in range(max(0, y), min(scr.h, y + hgt)):
+        a = yy * w
+        for i in range(a, a + w):
+            f, b = scr.fg[i], scr.bg[i]
+            if scr.ch[i] == " ":
+                scr.bg[i] = f if f != WHITE else RED
+            else:
+                scr.fg[i], scr.bg[i] = b, f
+
+
+def tint(scr, color, amt):
+    scr.fg = [mix(c, color, amt) for c in scr.fg]
+    scr.bg = [mix(c, color, amt * 0.35) for c in scr.bg]
+
+
+def scanline(scr, y, amt=0.45):
+    if 0 <= y < scr.h:
+        a = y * scr.w
+        for i in range(a, a + scr.w):
+            scr.fg[i] = mix(scr.fg[i], WHITE, amt)
+            scr.bg[i] = mix(scr.bg[i], DIM_CYAN, amt * 0.5)
+
+
+def melt(scr, m, drops, rnd):
+    """Columns slide down at different speeds; the gap fills with red noise."""
+    w, h = scr.w, scr.h
+    for x in range(w):
+        d = min(h, int(drops[x] * m * m * h * 1.4))
+        if d <= 0:
+            continue
+        heads = (
+            [rnd.choice("░▒▓ ") if rnd.random() < m else " " for _ in range(d)],
+            [mix(DIM_RED, RED, rnd.random())] * d,
+            [BG] * d,
+        )
+        for arr, head in zip((scr.ch, scr.fg, scr.bg), heads):
+            arr[x::w] = head + arr[x::w][: h - d]
+
+
+def glitch(scr, rnd, g, palette=(RED, CYAN, YELLOW, PINK)):
+    """Apply glitch damage scaled by intensity g in [0, 1]."""
+    if g <= 0.01:
+        return
+    for _ in range(int(g * 7)):
+        if rnd.random() < g:
+            tear(scr, rnd.randrange(scr.h), rnd.randint(1, 3), rnd.randint(-int(2 + 14 * g), int(2 + 14 * g)))
+    for _ in range(int(g * g * 9)):
+        corrupt_block(scr, rnd, palette)
+    scatter(scr, rnd, int(scr.n * 0.012 * g), palette)
+    if rnd.random() < g * 0.25:
+        invert_band(scr, rnd.randrange(scr.h), rnd.randint(1, 2))
+
+
+# ── system info, for flavor ─────────────────────────────────────────────────
+DEMO_PROCS = [
+    "relic-daemon", "kiroshi-optics", "sandevistan", "militech-fw", "netwatch-agent", "braindance",
+    "arasaka-sec", "trauma-team", "johnny.silverhand", "ripperdoc", "cyberdeck", "icebreaker",
+    "nightcity-dns", "afterlife-bar", "delamain", "mantis-blades", "datafort", "fixer-relay",
+]
+
+
+def demo_info():
+    """Made-up machine details, for recordings that end up in public."""
+    rnd = random.Random(2077)
+    procs = [(rnd.randint(300, 99999), rnd.choice(DEMO_PROCS)) for _ in range(120)]
+    return {"host": "NIGHT-CITY", "kernel": "7.2.0-relic", "user": "v", "uptime": "20:77:00", "tty": "/dev/pts/77", "procs": procs}
+
+
+def gather_info():
+    if os.environ.get("CSHUTDOWN_DEMO"):
+        return demo_info()
+    info = {"host": socket.gethostname().upper(), "kernel": os.uname().release, "procs": []}
+    try:
+        info["user"] = getpass.getuser()
+    except Exception:
+        info["user"] = "choom"
+    try:
+        with open("/proc/uptime") as f:
+            up = int(float(f.read().split()[0]))
+        info["uptime"] = "%d:%02d:%02d" % (up // 3600, up % 3600 // 60, up % 60)
+    except OSError:
+        info["uptime"] = "??:??:??"
+    procs = []
+    for d in os.listdir("/proc"):
+        if d.isdigit():
+            try:
+                with open("/proc/%s/comm" % d) as f:
+                    procs.append((int(d), f.read().strip()))
+            except OSError:
+                pass
+    info["procs"] = procs
+    try:
+        info["tty"] = os.ttyname(0)
+    except OSError:
+        info["tty"] = "/dev/null"
+    return info
+
+
+LORE = [
+    ("ERR", "RELIC.BIOCHIP: engram integrity 37.2% - DEGRADING"),
+    ("WRN", "KIROSHI_OPTICS: frame buffer desync @0x7FFE2077"),
+    ("ERR", "SANDEVISTAN: thermal runaway, core 6 at 98C"),
+    ("ERR", "NETWATCH: BLACKWALL breach in sector 0xDEAD"),
+    ("ERR", "ICE.DAEMON[2077]: segfault at 0000000000000000"),
+    ("WRN", "CYBERDECK: RAM 14/12 - buffer overrun"),
+    ("WRN", "ARASAKA.SEC: netrunner trace active, origin unknown"),
+    ("ERR", "NEURAL_LINK: synapse latency 999ms"),
+    ("ERR", "MANTIS_BLADES: actuator fault, retracting"),
+    ("WRN", "TRAUMA_TEAM: subscription lapsed, no pickup"),
+    ("ERR", "SOULKILLER: unauthorized engram copy detected"),
+    ("WRN", "SUBDERMAL_ARMOR: integrity 12%"),
+    ("ERR", "OPTICAL_CAMO: phase collapse"),
+    ("ERR", "MILITECH_FW: watchdog timeout"),
+    ("WRN", "BIOMONITOR: heart rate 212 bpm"),
+    ("ERR", "CORTEX: kernel panic - not syncing: VFS: unable to mount brain0"),
+]
+TAIL = [
+    ("SYS", "init: sending SIGTERM to all processes"),
+    ("SYS", "init: sending SIGKILL to remaining processes"),
+    ("SYS", "unmounting /dev/brain0 ... ok"),
+    ("SYS", "syncing filesystems ... done"),
+    ("ERR", "NEURAL_LINK: SEVERED"),
+    ("SYS", "reached target Power-Off"),
+    ("ERR", ">>> FLATLINE <<<"),
+]
+
+
+def build_log(info, rnd):
+    procs = info["procs"][:]
+    rnd.shuffle(procs)
+    lore = LORE[:]
+    rnd.shuffle(lore)
+    lines = [("SYS", "RELIC//OS 2.0.77 on %s (%s)" % (info["host"], info["kernel"]))]
+    pi = 0
+    for kind, text in lore:
+        lines.append((kind, text))
+        for _ in range(rnd.randint(2, 4)):
+            if pi < len(procs):
+                pid, comm = procs[pi]
+                pi += 1
+                lines.append(("KIL", "SIGTERM > %6d %s" % (pid, comm)))
+    lines.extend(TAIL)
+    stamp = 2077.0 + rnd.random()
+    out = []
+    for kind, text in lines:
+        stamp += rnd.uniform(0.0004, 0.03)
+        out.append((kind, "[%11.6f] %s" % (stamp, text)))
+    return out
+
+
+LOG_COLOR = {"ERR": RED, "WRN": YELLOW, "SYS": CYAN, "KIL": GREY}
+
+
+def ecg(phase):
+    """One heartbeat: P, QRS, T, sampled at phase in [0, 1)."""
+    p = phase % 1.0
+
+    def bump(c, wd, a):
+        return a * math.exp(-((p - c) / wd) ** 2)
+
+    return bump(0.15, 0.04, 0.12) + bump(0.29, 0.012, -0.18) + bump(0.32, 0.014, 1.0) + bump(0.35, 0.012, -0.32) + bump(0.58, 0.06, 0.25)
+
+
+# ── the show ─────────────────────────────────────────────────────────────────
+class Aborted(Exception):
+    pass
+
+
+class Hangup(Exception):
+    pass
+
+
+class Show:
+    def __init__(self, scr, duration, in_fd, info):
+        self.scr = scr
+        self.D = duration
+        self.in_fd = in_fd
+        self.info = info
+        self.rnd = random.Random()
+        self.abort_flag = False
+        D = duration
+        self.t_intro = D * 0.085
+        self.t_melt = D * 0.75
+        self.t_crt = D * 0.91
+        self.log = build_log(info, self.rnd)
+        n = len(self.log)
+        main = self.t_melt - self.t_intro
+        # log lines arrive slowly, then pour in
+        self.log_times = [self.t_intro + 0.25 + main * 0.95 * (k / n) ** 0.75 for k in range(n)]
+        # glitch spikes
+        self.spikes = []
+        t = 0.9
+        while t < D:
+            self.spikes.append((t, self.rnd.uniform(0.06, 0.16), self.rnd.uniform(0.6, 1.0)))
+            t += self.rnd.uniform(0.35, 0.9) * (1.0 - 0.5 * t / D)
+        # breach protocol
+        self.grid_n = 6
+        self.grid = [[self.rnd.choice(BREACH_CODES) for _ in range(6)] for _ in range(6)]
+        self.picks = []
+        r, c = 0, None
+        for k in range(6):
+            if k % 2 == 0:
+                c = self.rnd.choice([x for x in range(6) if x != c and (r, x) not in self.picks])
+            else:
+                r = self.rnd.choice([y for y in range(6) if y != r and (y, c) not in self.picks])
+            self.picks.append((r, c))
+        self.hexdump_base = self.rnd.randrange(0x7F0000000000, 0x7FFFFFFFFFFF) & ~0xF
+        self.drops = []
+        self.crt_snap = None
+
+    # ── timing helpers ──
+    def spike(self, t):
+        for s, d, a in self.spikes:
+            if s <= t < s + d:
+                return a
+        return 0.0
+
+    def check_input(self, timeout):
+        if self.abort_flag:
+            return True
+        try:
+            r, _, _ = select.select([self.in_fd], [], [], timeout)
+        except InterruptedError:
+            return self.abort_flag
+        if r:
+            try:
+                os.read(self.in_fd, 1024)
+            except OSError:
+                pass
+            return True
+        return self.abort_flag
+
+    # ── main loop ──
+    def run(self):
+        """Return True if the sequence completed, False if aborted."""
+        t0 = time.monotonic()
+        while True:
+            start = time.monotonic()
+            t = start - t0
+            if t >= self.D:
+                break
+            if self.scr.resize():
+                self.drops = []
+                self.crt_snap = None
+            self.render(t)
+            self.scr.flush()
+            if self.check_input(max(0.0, FRAME - (time.monotonic() - start))):
+                self.abort_sequence()
+                return False
+        # one last chance between the final frame and the command
+        if self.check_input(0):
+            self.abort_sequence()
+            return False
+        return True
+
+    def render(self, t):
+        if t < self.t_intro:
+            self.render_intro(t)
+        elif t < self.t_melt:
+            self.render_main(t)
+        elif t < self.t_crt:
+            self.render_meltdown(t)
+        else:
+            self.render_crt(t)
+
+    # ── phase 0: the crash ──
+    def render_intro(self, t):
+        scr, rnd = self.scr, self.rnd
+        scr.clear()
+        f = t / self.t_intro
+        if f < 0.22:
+            # raw static
+            ch, fg = scr.ch, scr.fg
+            for i in range(scr.n):
+                if rnd.random() < 0.7:
+                    ch[i] = rnd.choice(NOISE)
+                    fg[i] = mix(BG, rnd.choice((GREY, CYAN, RED, WHITE)), rnd.random() * 0.8)
+            if rnd.random() < 0.5:
+                tear(scr, rnd.randrange(scr.h), rnd.randint(2, 6), rnd.randint(-20, 20))
+            return
+        flash = int(t * 22) % 4 == 0
+        bgc = RED if flash else BG
+        if flash:
+            scr.clear(RED)
+        off = int(t * 30)
+        hazard(scr, 0, off, YELLOW if not flash else BLACK, bgc)
+        hazard(scr, 1, off + 1, YELLOW if not flash else BLACK, bgc)
+        hazard(scr, scr.h - 2, -off, YELLOW if not flash else BLACK, bgc)
+        hazard(scr, scr.h - 1, -off + 1, YELLOW if not flash else BLACK, bgc)
+        big = fit_big(["WARNING", "WARN"], scr.w - 4, scr.h - 8, [(3, 2), (2, 1), (1, 0.5)])
+        sub = "UNSCHEDULED SHUTDOWN // BLACKWALL BREACH DETECTED"
+        if big:
+            bx = (scr.w - big.w) // 2
+            by = (scr.h - big.h) // 2 - 1
+            jit = [rnd.randint(-3, 3) if rnd.random() < 0.2 else 0 for _ in range(big.h)]
+            draw_big_rgb(scr, bx, by, big, BLACK if flash else RED, 0 if flash else rnd.randint(1, 3), jit)
+            sy = by + big.h + 1
+        else:
+            sy = scr.h // 2
+        scr.put((scr.w - len(sub)) // 2, sy, decode(sub, (f - 0.22) / 0.6, rnd), BLACK if flash else YELLOW)
+        glitch(scr, rnd, 0.9 * (1 - f) + 0.2)
+
+    # ── phase 1: the HUD ──
+    def layout(self):
+        scr = self.scr
+        w, h = scr.w, scr.h
+        top, bottom = 2, h - 4
+        mid_h = bottom - top
+        L = {"top": top, "mid_h": mid_h}
+        if w >= 140:
+            lw, rw = int(w * 0.30), int(w * 0.24)
+        elif w >= 100:
+            lw, rw = int(w * 0.34), 0
+        else:
+            lw, rw = 0, 0
+        L["left"] = (0, top, lw, mid_h) if lw else None
+        L["right"] = (w - rw, top, rw, mid_h) if rw else None
+        cx = lw + (1 if lw else 0)
+        cw = w - lw - rw - (1 if lw else 0) - (1 if rw else 0)
+        L["center"] = (cx, top, cw, mid_h)
+        return L
+
+    def render_header(self, t, alarm=False):
+        scr = self.scr
+        w = scr.w
+        bar = RED if alarm else YELLOW
+        scr.put(0, 0, " " * w, BLACK, bar)
+        left = " ◢ RELIC//OS 2.0.77 ▸ EMERGENCY SHUTDOWN PROTOCOL"
+        right = "NODE %s ▸ %s ◣ " % (self.info["host"], time.strftime("%H:%M:%S"))
+        scr.put(0, 0, left, BLACK, bar)
+        if len(left) + len(right) + 2 < w:
+            scr.put(w - len(right), 0, right, BLACK, bar)
+        info = "UPTIME %s ▸ PROCS %d ▸ KERNEL %s ▸ USER %s ▸ TTY %s ▸ SESSION %08X" % (
+            self.info["uptime"],
+            len(self.info["procs"]),
+            self.info["kernel"],
+            self.info["user"],
+            self.info["tty"],
+            hash(self.info["host"]) & 0xFFFFFFFF,
+        )
+        info = info[: w - 2]
+        scr.put(1, 1, info, DIM_YELLOW)
+        # a highlight sweeps across the info line
+        hx = int((t * 60) % (w + 20)) - 10
+        for x in range(max(1, hx), min(1 + len(info), hx + 10)):
+            i = scr.w + x
+            scr.fg[i] = YELLOW
+
+    def render_footer(self, t, frac, last_chance=False):
+        scr = self.scr
+        w, h = scr.w, scr.h
+        y = h - 3
+        label = " SHUTDOWN SEQUENCE "
+        pct = " %3d%% " % int(frac * 100)
+        bw = w - len(label) - len(pct) - 4
+        scr.put(1, y, label, BLACK, YELLOW)
+        bx = len(label) + 2
+        fill = int(bw * frac)
+        for k in range(max(0, bw)):
+            if k % 3 == 2:
+                continue
+            if k < fill:
+                scr.cell(bx + k, y, "█", mix(YELLOW, RED, k / max(1, bw)))
+            elif k == fill:
+                scr.cell(bx + k, y, "▓", WHITE if int(t * 20) % 2 else YELLOW)
+            else:
+                scr.cell(bx + k, y, "░", DIM_YELLOW)
+        scr.put(w - len(pct) - 1, y, pct, YELLOW)
+        # abort prompt
+        msg = "▸▸ LAST CHANCE // PRESS ANY KEY TO ABORT ◂◂" if last_chance else "▸▸ PRESS ANY KEY TO ABORT ◂◂"
+        on = int(t * (8 if last_chance else 4)) % 2 == 0
+        mx = (w - len(msg) - 4) // 2
+        if on:
+            scr.put(mx, h - 2, "  " + msg + "  ", BLACK, RED)
+        else:
+            scr.put(mx, h - 2, "  " + msg + "  ", RED)
+        hazard(scr, h - 1, -int(t * 14), RED if last_chance else YELLOW)
+        remaining = max(0.0, self.D - t)
+        tag = " T-%05.2fs " % remaining
+        scr.put(w - len(tag) - 2, h - 1, tag, BLACK, YELLOW)
+
+    def render_log(self, t, rect, reveal, g):
+        scr = self.scr
+        x, y, w, h = rect
+        box(scr, x, y, w, h, DIM_CYAN if g < 0.5 else RED, "SYS.LOG", reveal)
+        if reveal < 1:
+            return
+        iw, ih = w - 4, h - 2
+        shown = [k for k, lt in enumerate(self.log_times) if lt <= t]
+        shown = shown[-ih:]
+        for row, k in enumerate(shown):
+            kind, text = self.log[k]
+            age = t - self.log_times[k]
+            n = int(len(text) * clamp(age / 0.12))
+            col = LOG_COLOR[kind]
+            if age < 0.15:
+                col = WHITE
+            line = text[:n]
+            if n < len(text):
+                line += self.rnd.choice(GLYPHS)
+            scr.put(x + 2, y + 1 + row, line[:iw], col)
+            if kind == "ERR" and row == len(shown) - 1:
+                scr.cell(x + 1, y + 1 + row, "▶", RED)
+        if shown and int(t * 6) % 2:
+            row = len(shown)
+            if row < ih:
+                scr.cell(x + 2, y + 1 + row, "█", CYAN)
+
+    def render_breach(self, t, p, rect, reveal):
+        scr, rnd = self.scr, self.rnd
+        x, y, w, h = rect
+        box(scr, x, y, w, h, DIM_CYAN, "BREACH PROTOCOL", reveal, BLACK, CYAN)
+        if reveal < 1:
+            return
+        ix = x + 2
+        cy = y + 2
+        # pick k happens at p = 0.08 + k * 0.1
+        pick_at = [0.08 + k * 0.1 for k in range(len(self.picks))]
+        done = sum(1 for pa in pick_at if p >= pa)
+        buf = " ".join(self.grid[r][c] if k < done else "__" for k, (r, c) in enumerate(self.picks))
+        scr.put(ix, cy, "BUFFER ", GREY)
+        scr.put(ix + 7, cy, buf, CYAN)
+        cy += 2
+        n = self.grid_n
+        gw = n * 4
+        gx = ix + max(0, (w - 4 - gw) // 2)
+        # current selection line: row for even picks, column for odd
+        if done < len(self.picks):
+            k = done
+            lr, lc = self.picks[k - 1] if k else (0, None)
+            prev = pick_at[k - 1] if k else 0.0
+            sweep = clamp((p - prev) / (pick_at[k] - prev))
+            tr, tc = self.picks[k]
+            if k % 2 == 0:
+                hl = ("row", tr)
+                cur = (tr, int(round(sweep * tc)) if sweep < 0.8 else tc)
+            else:
+                hl = ("col", tc)
+                cur = (int(round(sweep * tr)) if sweep < 0.8 else tr, tc)
+        else:
+            hl, cur = None, None
+        picked = set(self.picks[:done])
+        for r in range(n):
+            if cy + r * 2 >= y + h - 1:
+                break
+            for c in range(n):
+                cx = gx + c * 4
+                code = self.grid[r][c]
+                col, bgc = GREY, None
+                if hl and ((hl[0] == "row" and hl[1] == r) or (hl[0] == "col" and hl[1] == c)):
+                    col, bgc = WHITE, 0x1A1A2A
+                if (r, c) in picked:
+                    code, col = "[]", DIM_CYAN
+                if cur == (r, c):
+                    col, bgc = BLACK, CYAN
+                if rnd.random() < 0.01:
+                    code = rnd.choice(HEX) + rnd.choice(HEX)
+                    col = RED
+                scr.put(cx, cy + r * 2, " %s " % code, col, bgc)
+        cy += n * 2 + 1
+        if cy >= y + h - 2:
+            return
+        scr.put(ix, cy, "DAEMONS", GREY)
+        cy += 1
+        daemons = [("ICEPICK", 0.2), ("DATAMINE_V3", 0.38), ("NEURAL_DAMPENER", 0.56), ("SYS.HALT", 0.98)]
+        start = 0.05
+        for name, end in daemons:
+            if cy >= y + h - 1:
+                return
+            if p >= end:
+                scr.put(ix, cy, "■ " + name, CYAN)
+                scr.put(x + w - 11, cy, "UPLOADED", CYAN)
+            elif p >= start:
+                f = (p - start) / (end - start)
+                scr.put(ix, cy, "□ " + name, YELLOW)
+                bw = 8
+                bar = "█" * int(bw * f) + "░" * (bw - int(bw * f))
+                scr.put(x + w - 11, cy, bar, YELLOW)
+            else:
+                scr.put(ix, cy, "□ " + name, GREY)
+                scr.put(x + w - 11, cy, "QUEUED", GREY)
+            start = end
+            cy += 1
+        if p >= 0.98 and cy < y + h - 1:
+            scr.put(ix, cy, "BREACH SUCCESSFUL", BLACK if int(t * 8) % 2 else CYAN, CYAN if int(t * 8) % 2 else None)
+            cy += 1
+        cy += 1
+        # scrolling memory dump in whatever room is left
+        rows = y + h - 1 - cy
+        if rows <= 0:
+            return
+        step = int(t * 40)
+        for k in range(rows):
+            addr = self.hexdump_base + (step + k) * 16
+            r2 = random.Random(step + k)
+            nbytes = max(0, min(8, (w - 20) // 3))
+            data = " ".join("%02X" % r2.randrange(256) for _ in range(nbytes))
+            col = mix(DIM_CYAN, RED, p * r2.random())
+            scr.put(ix, cy + k, "%012X %s" % (addr, data), col)
+
+    def render_center(self, t, p, rect, mode="main", g=0.0):
+        scr, rnd = self.scr, self.rnd
+        x, y, w, h = rect
+        if w < 10 or h < 3:
+            return
+        remaining = max(0.0, self.D - t)
+        digits = "%02d" % math.ceil(remaining) if mode == "main" else "00"
+        if mode == "melt":
+            titles = [("FLATLINE", (2, 1)), ("FLATLINE", (1, 0.5))]
+        else:
+            titles = [
+                ("SYSTEM FAILURE", (2, 1)), ("SYSTEM\nFAILURE", (2, 1)),
+                ("SYSTEM FAILURE", (1, 0.5)), ("SYSTEM\nFAILURE", (1, 0.5)), ("FAILURE", (1, 0.5)),
+            ]
+        counts = [((3, 2), 6), ((3, 2), 4), ((2, 1), 4), ((2, 1), 3), ((2, 1), 0), ((1, 0.5), 0)]
+        # the biggest title that fits, then the biggest countdown and heart monitor under it
+        plan = None
+        for ttext, tscale in titles + [(None, None)]:
+            title = Big(ttext, *tscale) if ttext else None
+            if title and title.w > w - 2:
+                continue
+            for cscale, ecg_h in counts:
+                cnt = Big(digits, *cscale)
+                if cnt.w > w - 8:
+                    continue
+                total = (title.h if title else 1) + 3 + 1 + cnt.h + 1 + ecg_h + (1 if ecg_h else 0) + 1
+                if total <= h:
+                    plan = (title, tscale, cnt, ecg_h, total)
+                    break
+            if plan:
+                break
+        if not plan:
+            msg = "SHUTDOWN T-%05.2f" % remaining
+            scr.put(x + (w - len(msg)) // 2, y + h // 2, msg, YELLOW)
+            return
+        title, tscale, cnt, ecg_h, total = plan
+        # on a glitch spike the title briefly shows another word in the same slot
+        if title and mode == "main" and g > 0.55 and rnd.random() < 0.5:
+            alt = Big(rnd.choice(["SHUTDOWN", "ERR0R", "FLATLINE", "DELETED"]), *tscale)
+            if alt.w <= w - 2:
+                title = alt
+        cy = y + (h - total) // 2
+
+        # title
+        if title:
+            tx = x + (w - title.w) // 2
+            jit = None
+            if mode == "melt":
+                # a dark plate keeps FLATLINE legible on top of the wreckage
+                scr.fill(tx - 2, cy, title.w + 4, title.h, " ", BG, BG)
+                split = 1 if tscale[0] > 1 else 0
+                jit = [rnd.randint(-2, 2) if rnd.random() < 0.25 else 0 for _ in range(title.h)]
+            else:
+                split = (1 if tscale[0] > 1 else 0) + int(g * 2.5)
+                if g > 0.3:
+                    jit = [rnd.randint(-int(1 + 4 * g), int(1 + 4 * g)) if rnd.random() < g else 0 for _ in range(title.h)]
+            draw_big_rgb(scr, tx, cy, title, lambda r, hh: mix(PINK, RED, r / hh), split, jit)
+            cy += title.h
+        else:
+            word = "FLATLINE" if mode == "melt" else "SYSTEM FAILURE"
+            scr.put(x + (w - len(word)) // 2, cy, word, RED)
+            cy += 1
+        cy += 1
+        if mode == "melt":
+            sub = "CONNECTION TERMINATED // GOODNIGHT, %s" % self.info["user"].upper()
+            scol = RED
+        else:
+            sub = "CRITICAL ERROR // NEURAL LINK SEVERED // SHUTDOWN IMMINENT"
+            scol = WHITE
+        sub = decode(sub, (t - self.t_intro) / 0.6 if mode == "main" else 1.0, rnd)[: w - 2]
+        scr.put(x + (w - len(sub)) // 2, cy, sub, scol)
+        cy += 2
+        label = "TIME TO FLATLINE"
+        scr.put(x + (w - len(label)) // 2, cy, label, GREY)
+        cy += 1
+
+        # countdown
+        frac = remaining - math.floor(remaining)
+        tick = mode == "main" and frac > 0.88
+        col = RED if remaining < 3 or mode != "main" else YELLOW
+        if tick:
+            col = WHITE
+        ccx = x + (w - cnt.w - 4) // 2
+        draw_big_rgb(scr, ccx, cy, cnt, lambda r, hh: mix(col, ORANGE if col == YELLOW else col, r / hh * 0.6), 2 if tick else (1 if g > 0.4 else 0))
+        cents = ".%02d" % int(frac * 100) if mode == "main" else ".00"
+        scr.put(ccx + cnt.w + 1, cy + cnt.h - 1, cents, col)
+        scr.put(ccx + cnt.w + 1, cy, "SEC", GREY)
+        cy += cnt.h + 1
+
+        # heart monitor
+        if ecg_h:
+            ew = min(w - 4, 90)
+            ex = x + (w - ew) // 2
+            self.render_ecg(t, ex, cy, ew, ecg_h, mode)
+            cy += ecg_h + 1
+
+        # vitals
+        if mode == "melt":
+            vit = "CPU ---  ▸  MEM ---  ▸  NET OFFLINE  ▸  BPM 000"
+            vcol = RED
+        else:
+            cpu = min(100, int(60 + 40 * p + rnd.randint(-3, 3)))
+            mem = min(100, int(70 + 30 * p))
+            bpm = int(72 + 140 * p) + rnd.randint(-4, 4)
+            net = "LINKED" if p < 0.5 else ("UNSTABLE" if p < 0.8 else "LOST")
+            vit = "CPU %3d%%  ▸  MEM %3d%%  ▸  NET %s  ▸  BPM %3d" % (cpu, mem, net, bpm)
+            vcol = mix(CYAN, RED, p)
+        scr.put(x + (w - len(vit)) // 2, cy, vit[: w - 2], vcol)
+
+    def render_ecg(self, t, x, y, w, h, mode):
+        scr = self.scr
+        pw, ph = w * 2, h * 4
+        dots = [[0] * w for _ in range(h)]
+        bits = ((0x01, 0x08), (0x02, 0x10), (0x04, 0x20), (0x40, 0x80))
+        pps = pw / 2.5  # pixels per second of scroll
+        mid = ph * 0.66
+        prev = None
+        main_len = self.t_melt - self.t_intro
+        for px in range(pw):
+            tx = t - (pw - 1 - px) / pps
+            pp = clamp((tx - self.t_intro) / main_len)
+            if mode == "melt" and tx >= self.t_melt:
+                amp = 0.0
+            else:
+                amp = (1 - pp ** 1.6) * 0.9
+            period = 0.85 - 0.5 * pp
+            beat = ecg(tx / period) * amp
+            jitter = self.rnd.uniform(-0.04, 0.04) * pp
+            py = int(mid - (beat + jitter) * ph * 0.78)
+            py = max(0, min(ph - 1, py))
+            lo, hi = (py, py) if prev is None else (min(prev, py), max(prev, py))
+            for yy in range(lo, hi + 1):
+                dots[yy // 4][px // 2] |= bits[yy % 4][px % 2]
+            prev = py
+        col = mix(CYAN, RED, clamp((t - self.t_intro) / (self.t_melt - self.t_intro)) ** 0.7) if mode == "main" else RED
+        for r in range(h):
+            row = "".join(chr(0x2800 + b) for b in dots[r])
+            scr.put(x, y + r, row, col)
+        # the write head
+        scr.put(x + w - 1, y + int(mid / 4), "◀", WHITE)
+        if mode == "melt":
+            lbl = " FLATLINE "
+            if int(t * 6) % 2:
+                scr.put(x + (w - len(lbl)) // 2, y, lbl, BLACK, RED)
+
+    def render_main(self, t):
+        scr, rnd = self.scr, self.rnd
+        scr.clear()
+        p = (t - self.t_intro) / (self.t_melt - self.t_intro)
+        g = 0.04 + 0.45 * p * p + self.spike(t)
+        g = clamp(g)
+        reveal = ease_out((t - self.t_intro) / 0.45)
+        L = self.layout()
+        self.render_header(t, alarm=g > 0.7)
+        if L["left"]:
+            self.render_log(t, L["left"], reveal, g)
+        if L["right"]:
+            self.render_breach(t, p, L["right"], reveal)
+        cx, cy, cw, ch = L["center"]
+        if cw > 10:
+            self.render_center(t, p, (cx, cy, cw, ch), "main", g)
+        self.render_footer(t, t / self.D, last_chance=self.D - t < 3.0)
+        scanline(scr, int((t * 18) % scr.h))
+        if self.spike(t) > 0.8 and rnd.random() < 0.5:
+            tint(scr, RED, 0.35)
+        glitch(scr, rnd, g)
+
+    # ── phase 2: meltdown ──
+    def render_meltdown(self, t):
+        scr, rnd = self.scr, self.rnd
+        scr.clear()
+        m = (t - self.t_melt) / (self.t_crt - self.t_melt)
+        if len(self.drops) != scr.w:
+            self.drops = [rnd.uniform(0.15, 1.0) ** 2 for _ in range(scr.w)]
+        L = self.layout()
+        self.render_header(t, alarm=True)
+        if L["left"]:
+            self.render_log(t, L["left"], 1.0, 1.0)
+        if L["right"]:
+            self.render_breach(t, 1.0, L["right"], 1.0)
+        self.render_footer(t, t / self.D, last_chance=True)
+        glitch(scr, rnd, 0.5 + 0.5 * m)
+        melt(scr, m, self.drops, rnd)
+        for _ in range(int(3 + 6 * m)):
+            tear(scr, rnd.randrange(scr.h), rnd.randint(1, 4), rnd.randint(-30, 30))
+        # FLATLINE stays on top of the wreckage
+        cx, cy, cw, ch = L["center"]
+        if cw > 10:
+            self.render_center(t, 1.0, (cx, cy, cw, ch), "melt", 0.6 + 0.4 * m)
+        tint(scr, RED, 0.15 + 0.5 * m)
+        if rnd.random() < 0.15 + 0.3 * m:
+            invert_band(scr, rnd.randrange(scr.h), rnd.randint(1, 4))
+        self.crt_snap = scr.snapshot()
+
+    # ── phase 3: CRT power-off ──
+    def render_crt(self, t):
+        scr = self.scr
+        c = (t - self.t_crt) / (self.D - self.t_crt)
+        scr.clear(BLACK)
+        w, h = scr.w, scr.h
+        cy = h // 2
+        snap = self.crt_snap
+        if c < 0.45 and snap and snap[0] == w and snap[1] == h:
+            # squash the last frame into a shrinking band, burning to white
+            k = c / 0.45
+            bh = max(1, int(h * (1 - k) ** 2.2))
+            _, _, sch, sfg, sbg = snap
+            y0 = cy - bh // 2
+            for i in range(bh):
+                sy = int(i * h / bh)
+                dy = y0 + i
+                if not 0 <= dy < h:
+                    continue
+                a, b = sy * w, dy * w
+                scr.ch[b : b + w] = sch[a : a + w]
+                scr.fg[b : b + w] = [mix(f, WHITE, k ** 0.6) for f in sfg[a : a + w]]
+                scr.bg[b : b + w] = [mix(g, WHITE, k ** 1.5) for g in sbg[a : a + w]]
+        elif c < 0.72:
+            k = (c - 0.45) / 0.27
+            lw = max(1, int(w * (1 - k) ** 2))
+            x0 = (w - lw) // 2
+            scr.put(x0, cy, "━" * lw, WHITE)
+            if lw > 6:
+                scr.put(x0 + 2, cy - 1, "─" * (lw - 4), mix(BLACK, CYAN, 0.6 * (1 - k)))
+                scr.put(x0 + 2, cy + 1, "─" * (lw - 4), mix(BLACK, PINK, 0.6 * (1 - k)))
+        elif c < 0.95:
+            k = (c - 0.72) / 0.23
+            scr.cell(w // 2, cy, "●" if k < 0.5 else "•", mix(WHITE, BLACK, k))
+            msg = "// SIGNAL LOST"
+            scr.put((w - len(msg)) // 2, cy + 2, msg, mix(BLACK, GREY, 1 - k))
+
+    # ── abort ──
+    def abort_sequence(self):
+        scr, rnd = self.scr, self.rnd
+        snap = scr.snapshot()
+        t0 = time.monotonic()
+        dur = 2.0
+        user = self.info["user"].upper()
+        lines = [
+            ("> SHUTDOWN.EXE ........ ", "TERMINATED", RED),
+            ("> NEURAL LINK ......... ", "STABLE", GREEN),
+            ("> BLACKWALL ........... ", "RESTORED", GREEN),
+            ("> BIOMONITOR .......... ", "72 BPM", GREEN),
+        ]
+        while True:
+            start = time.monotonic()
+            a = start - t0
+            if a >= dur:
+                break
+            scr.resize()
+            if a < 0.3:
+                # rewind: the last frame tears itself apart in cyan
+                if not scr.restore(snap):
+                    scr.clear()
+                tint(scr, CYAN, 0.25 + a)
+                glitch(scr, rnd, 1.0, (CYAN, WHITE, DIM_CYAN, YELLOW))
+                for _ in range(8):
+                    tear(scr, rnd.randrange(scr.h), rnd.randint(1, 5), rnd.randint(-40, 40))
+            else:
+                k = (a - 0.3) / (dur - 0.3)
+                scr.clear(BLACK)
+                w, h = scr.w, scr.h
+                off = int(a * 10)
+                hazard(scr, 0, off, CYAN, BLACK)
+                hazard(scr, h - 1, -off, CYAN, BLACK)
+                big = fit_big(["ABORTED"], w - 6, h - 10, [(3, 2), (2, 1), (1, 0.5)])
+                total = (big.h if big else 1) + 2 + len(lines) + 2
+                y = max(2, (h - total) // 2)
+                if big:
+                    split = int(4 * (1 - k) ** 2)
+                    jit = [rnd.randint(-2, 2) if rnd.random() < (1 - k) * 0.4 else 0 for _ in range(big.h)]
+                    flick = k < 0.25 and int(a * 30) % 3 == 0
+                    color = WHITE if flick else (lambda r, hh: mix(CYAN, 0x00A0FF, r / hh))
+                    draw_big_rgb(scr, (w - big.w) // 2, y, big, color, split, jit)
+                    y += big.h + 2
+                else:
+                    scr.put((w - 7) // 2, y, "ABORTED", CYAN)
+                    y += 3
+                lw = max(len(l[0]) + len(l[1]) for l in lines)
+                lx = (w - lw) // 2
+                for i, (head, tail, col) in enumerate(lines):
+                    li = clamp((k - 0.1 - i * 0.12) / 0.15)
+                    if li <= 0:
+                        continue
+                    s = head + tail
+                    n = int(len(s) * li)
+                    scr.put(lx, y + i, head[:n], GREY)
+                    if n > len(head):
+                        scr.put(lx + len(head), y + i, tail[: n - len(head)], col)
+                y += len(lines) + 1
+                if k > 0.55:
+                    wb = "WELCOME BACK, %s." % user
+                    scr.put((w - len(wb)) // 2, y, decode(wb, (k - 0.55) / 0.12, rnd), YELLOW)
+                glitch(scr, rnd, 0.35 * (1 - k) ** 2, (CYAN, WHITE, DIM_CYAN))
+            scr.flush()
+            self.check_input(max(0.0, FRAME - (time.monotonic() - start)))
+
+
+# ── terminal plumbing ────────────────────────────────────────────────────────
+def ancestors():
+    pids, pid = set(), os.getpid()
+    while pid > 1 and pid not in pids:
+        pids.add(pid)
+        try:
+            with open("/proc/%d/stat" % pid) as f:
+                pid = int(f.read().rsplit(")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            break
+    return pids
+
+
+def hypr_fullscreen():
+    """Fullscreen this terminal's window under Hyprland.
+
+    Only acts when the focused window's process is one of our ancestors, so a
+    slow-to-map terminal can never make it fullscreen somebody else's window.
+    """
+    if not os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"):
+        return
+    try:
+        out = subprocess.run(["hyprctl", "activewindow", "-j"], capture_output=True, text=True, timeout=1).stdout
+        win = json.loads(out or "{}")
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return
+    if win.get("fullscreen") or win.get("pid") not in ancestors():
+        return
+    # Hyprland 0.55+ takes Lua dispatchers; older releases take the classic form
+    for cmd in ('hl.dsp.window.fullscreen({ mode = "fullscreen" })', "fullscreen 0"):
+        try:
+            if subprocess.run(["hyprctl", "dispatch", cmd], capture_output=True, timeout=1).returncode == 0:
+                return
+        except (OSError, subprocess.SubprocessError):
+            return
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Cyberpunk 2077 style shutdown. Any key aborts.")
+    ap.add_argument("--dry-run", action="store_true", help="play the sequence but do not shut down")
+    ap.add_argument("--duration", type=float, default=9.0, help="seconds before shutdown (3 to 9.9, default 9)")
+    ap.add_argument("--fullscreen", action="store_true", help="make this terminal window fullscreen first (Hyprland)")
+    ap.add_argument("--version", action="version", version="cshutdown " + VERSION)
+    args = ap.parse_args()
+    duration = min(9.9, max(3.0, args.duration))
+
+    in_fd, out_fd = sys.stdin.fileno(), sys.stdout.fileno()
+    if not (os.isatty(in_fd) and os.isatty(out_fd)):
+        print("cshutdown: needs an interactive terminal, so it can be aborted", file=sys.stderr)
+        return 2
+
+    if args.fullscreen:
+        hypr_fullscreen()
+    info = gather_info()
+    scr = Screen(out_fd)
+    show = Show(scr, duration, in_fd, info)
+
+    def on_int(signum, frame):
+        show.abort_flag = True
+
+    def on_hup(signum, frame):
+        raise Hangup()
+
+    signal.signal(signal.SIGINT, on_int)
+    signal.signal(signal.SIGQUIT, on_int)
+    signal.signal(signal.SIGTERM, on_hup)
+    signal.signal(signal.SIGHUP, on_hup)
+    # the countdown runs on wall-clock time, so a suspend/resume must never
+    # fast-forward into a shutdown: ignore job-control stops, abort on resume
+    signal.signal(signal.SIGTSTP, signal.SIG_IGN)
+    signal.signal(signal.SIGCONT, on_int)
+
+    old = termios.tcgetattr(in_fd)
+    new = termios.tcgetattr(in_fd)
+    # no ISIG: Ctrl-C / Ctrl-Z / Ctrl-\ arrive as plain keypresses, which abort
+    new[3] &= ~(termios.ECHO | termios.ICANON | termios.ISIG)
+    new[6][termios.VMIN] = 0
+    new[6][termios.VTIME] = 0
+    completed = False
+    try:
+        termios.tcsetattr(in_fd, termios.TCSAFLUSH, new)
+        os.write(out_fd, b"\x1b[?1049h\x1b[?25l\x1b[?7l\x1b[2J")
+        completed = show.run()
+    except Hangup:
+        completed = False
+    except BaseException:
+        completed = False
+        raise
+    finally:
+        try:
+            termios.tcflush(in_fd, termios.TCIFLUSH)
+            termios.tcsetattr(in_fd, termios.TCSANOW, old)
+            os.write(out_fd, b"\x1b[0m\x1b[?7h\x1b[?25h\x1b[?1049l")
+        except OSError:
+            pass
+
+    if not completed:
+        print("\x1b[38;2;0;240;255m▸ shutdown aborted.\x1b[0m welcome back, %s." % info["user"])
+        return 1
+    if args.dry_run:
+        print("\x1b[38;2;252;238;10m▸ dry run:\x1b[0m would run `%s`" % " ".join(SHUTDOWN_CMD))
+        return 0
+    try:
+        rc = subprocess.run(SHUTDOWN_CMD).returncode
+    except OSError as e:
+        print("cshutdown: could not run %s: %s" % (SHUTDOWN_CMD[0], e), file=sys.stderr)
+        rc = 1
+    if rc != 0:
+        print("cshutdown: `%s` failed (exit %d)" % (" ".join(SHUTDOWN_CMD), rc), file=sys.stderr)
+        try:
+            input("press enter to close ")
+        except (EOFError, KeyboardInterrupt):
+            pass
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main())
